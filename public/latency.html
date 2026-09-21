@@ -30,6 +30,12 @@
         <a id="openReplay" class="compare-open-replay" href="#" target="_blank" rel="noopener" style="display:none">↗ 在复盘中打开本场</a>
       </div>
       <div id="sessLoading" class="muted" style="margin-top:10px">正在读取已结束场次列表…</div>
+      <!-- 单场详情加载态：切换场次后、当前选择的响应到达前明确展示；
+           过期（已被更新选择取代）的请求响应不会再改写页面，故不会闪烁 -->
+      <div id="detailLoading" class="lat-detail-loading" style="display:none;margin-top:10px">
+        <span class="lat-spinner" aria-hidden="true"></span>
+        <span id="detailLoadingText">正在读取场次详情…</span>
+      </div>
 
       <div class="replay-filters" id="filterBar" style="display:none;margin-top:14px">
         <label for="positionFilter">岗位</label>
@@ -71,6 +77,8 @@
     const sessionSelect = document.getElementById('sessionSelect');
     const openReplay = document.getElementById('openReplay');
     const sessLoading = document.getElementById('sessLoading');
+    const detailLoading = document.getElementById('detailLoading');
+    const detailLoadingText = document.getElementById('detailLoadingText');
     const filterBar = document.getElementById('filterBar');
     const positionFilter = document.getElementById('positionFilter');
     const resultFilter = document.getElementById('resultFilter');
@@ -85,19 +93,35 @@
     let fileId = null;
     let runId = null;
 
+    // 详情请求仲裁：「最后一次选择生效」。每次选择场次自增 loadSeq 并记录
+    // file/run；只有仍与最新选择一致（未被后续选择取代）的成功 / 失败响应
+    // 才允许更新分析结果、告警、筛选、提示与地址栏，过期响应一律静默丢弃。
+    // AbortController 同时在切换时主动取消在途旧请求（接口为只读 GET，取消
+    // 只影响本页等待，服务端无任何副作用），seq 校验再兜底乱序 / 取消失败。
+    let loadSeq = 0;
+    let detailAbort = null;
+
     // 结果下拉的合法取值（与 <select> 选项保持一致；'all' 即「全部结果」）
     const RESULT_VALUES = new Set(['all', 'ok', 'late', 'timeout', 'revised', 'paused', 'substituted']);
 
     // 当前场次 + 筛选状态写回地址栏（replaceState，不产生历史记录）：
     // file/run/position/result 始终与下拉一致，刷新页面 / 转发链接都能复现筛选状态；
     // 任一下拉回到「全部」时对应参数从 URL 移除（列表恢复完整）。
-    function syncUrl() {
+    // 所有写地址栏的动作只允许来自当前选择（loadSeq 仲裁通过）的响应 / 筛选变更，
+    // 且 file/run 由仲裁后的调用方显式传入，过期响应无法把旧场次写进地址栏。
+    function buildLatencyUrl(f, r, position, result) {
       const q = new URLSearchParams();
-      q.set('file', fileId);
-      q.set('run', String(runId));
-      if (positionFilter.value !== 'all') q.set('position', positionFilter.value);
-      if (resultFilter.value !== 'all') q.set('result', resultFilter.value);
-      history.replaceState(null, '', `latency.html?${q.toString()}`);
+      q.set('file', f);
+      q.set('run', String(r));
+      if (position && position !== 'all') q.set('position', position);
+      if (result && result !== 'all') q.set('result', result);
+      return `latency.html?${q.toString()}`;
+    }
+    function replaceUrl(f, r, position, result) {
+      history.replaceState(null, '', buildLatencyUrl(f, r, position, result));
+    }
+    function syncUrl() {
+      replaceUrl(fileId, runId, positionFilter.value, resultFilter.value);
     }
 
     function refValue(s) { return `${s.fileId}/${s.runId}`; }
@@ -379,29 +403,83 @@
 
     let rawPayload = null;
 
+    // 切换 / 加载单场详情。「最后一次选择生效」：
+    //   - 进入即领取新的 seq 并取消上一个仍在途的只读请求；
+    //   - await 之后先校验 seq 与 file/run，过期响应（无论成功失败）静默丢弃，
+    //     不触碰分析结果、告警、筛选、提示与地址栏；
+    //   - 只有当前选择的响应可以落地：成功渲染瀑布并把最终筛选写回地址栏，
+    //     失败展示错误提示并把当前选择写入地址栏（刷新 / 转发与下拉一致）。
     async function loadSession(ref) {
       const [f, ...rParts] = String(ref).split('/');
-      const r = rParts.join('/');
+      const r = Number(rParts.join('/'));
+      const seq = ++loadSeq;
+      // 取消上一个在途请求（纯只读 GET，取消无服务端副作用）；seq 校验兜底
+      if (detailAbort) { try { detailAbort.abort(); } catch { /* 旧环境无 AbortController 时忽略 */ } }
+      detailAbort = typeof AbortController === 'function' ? new AbortController() : null;
+
+      // 当前选择立即反映在场次下拉与页面状态上，并进入明确加载态；
+      // 上一场的分析结果 / 告警 / 筛选 / 瀑布在等待期间清空，避免新旧内容错配
       fileId = f;
-      runId = Number(r);
+      runId = r;
+      analysis = null;
+      rawPayload = null;
       filterBar.style.display = 'none';
+      positionFilter.disabled = true;
+      resultFilter.disabled = true;
+      positionFilter.innerHTML = '';
+      resultFilter.value = 'all';
       cueList.innerHTML = '';
       summaryBox.innerHTML = '';
       warnBox.classList.remove('show');
+      warnBox.innerHTML = '';
       emptyHint.style.display = 'none';
-      let payload;
+      emptyHint.innerHTML = '';
+      openReplay.style.display = 'none';
+      detailLoadingText.textContent = '正在读取场次详情…';
+      detailLoading.style.display = '';
+
+      // 切换场次时携带地址栏现有筛选作为新场次预选（loadSession 落地时校验；
+      // 岗位在新场次不存在 / result 非法时回落「全部」），不读旧下拉控件值
+      const params = new URLSearchParams(location.search);
+      const carryPosition = params.get('position') || 'all';
+      const carryResult = params.get('result') || 'all';
+
+      let payload = null;
+      let failed = false;
       try {
-        payload = await (await fetch(`/api/replay/sessions/${encodeURIComponent(f)}/${encodeURIComponent(r)}`)).json();
-      } catch {
+        const res = await fetch(
+          `/api/replay/sessions/${encodeURIComponent(f)}/${encodeURIComponent(r)}`,
+          detailAbort ? { signal: detailAbort.signal } : undefined
+        );
+        // 过期响应（已有更新的选择）：静默丢弃，不解析、不渲染
+        if (seq !== loadSeq || fileId !== f || runId !== r) return;
+        payload = await res.json();
+      } catch (err) {
+        if (err && err.name === 'AbortError') return; // 被更新选择取代：静默丢弃
+        if (seq !== loadSeq || fileId !== f || runId !== r) return;
+        failed = true;
+      }
+
+      // 二次校验：fetch 与 json 之间也可能发生切换
+      if (seq !== loadSeq || fileId !== f || runId !== r) return;
+      detailLoading.style.display = 'none';
+
+      if (failed) {
+        // 当前选择的失败响应：只更新当前选择的提示与地址栏
         emptyHint.style.display = '';
         emptyHint.innerHTML = '<span style="color:#ff9c9c">场次数据加载失败，请确认服务已启动</span>';
+        const safeResult = RESULT_VALUES.has(carryResult) ? carryResult : 'all';
+        replaceUrl(f, r, carryPosition !== 'all' ? carryPosition : null, safeResult);
         return;
       }
       if (payload.error) {
         emptyHint.style.display = '';
         emptyHint.innerHTML = `<span style="color:#ff9c9c">${E(payload.error)}</span>`;
+        const safeResult = RESULT_VALUES.has(carryResult) ? carryResult : 'all';
+        replaceUrl(f, r, carryPosition !== 'all' ? carryPosition : null, safeResult);
         return;
       }
+
       rawPayload = payload;
       analysis = CueLatency.analyzeSession(payload);
 
@@ -410,16 +488,17 @@
       // 筛选状态从地址栏深链参数恢复（页面刷新 / 重新加载 / 转发链接同一路径）：
       // position 必须是本场实际存在的岗位，result 必须是结果下拉的合法取值；
       // 缺失 / 非法参数回落到「全部」。只读 GET 接口与参数均不变，仅前端恢复 UI。
-      const params = new URLSearchParams(location.search);
-      const presetPos = params.get('position');
-      positionFilter.value = (presetPos && analysis.positions.includes(presetPos)) ? presetPos : 'all';
-      const presetResult = params.get('result');
-      resultFilter.value = (presetResult && RESULT_VALUES.has(presetResult)) ? presetResult : 'all';
+      positionFilter.value = (carryPosition !== 'all' && analysis.positions.includes(carryPosition))
+        ? carryPosition : 'all';
+      resultFilter.value = RESULT_VALUES.has(carryResult) ? carryResult : 'all';
 
+      positionFilter.disabled = false;
+      resultFilter.disabled = false;
       filterBar.style.display = '';
       openReplay.href = replayHref(null);
       openReplay.style.display = '';
-      syncUrl();
+      // 仅当前选择的成功响应可以把最终生效的 file/run/筛选写回地址栏
+      replaceUrl(f, r, positionFilter.value, resultFilter.value);
       render();
     }
 

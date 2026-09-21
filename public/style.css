@@ -749,6 +749,20 @@ tr.current-row td { background: #24304a; }
 .lat-picker-row { display: flex; align-items: center; gap: 12px; }
 .lat-picker-row select { flex: 1 1 auto; }
 
+/* 单场详情加载态：快速切换场次期间明确提示「正在读取当前选择」；
+   过期请求的响应被静默丢弃，加载态只在当前选择落地时收起，不闪烁旧场内容 */
+.lat-detail-loading {
+  display: flex; align-items: center; gap: 8px;
+  color: #aab2c5; font-size: 13px;
+}
+.lat-spinner {
+  width: 13px; height: 13px; flex: 0 0 auto;
+  border: 2px solid #3a4052; border-top-color: #8ab4ff;
+  border-radius: 50%;
+  animation: lat-spin 0.8s linear infinite;
+}
+@keyframes lat-spin { to { transform: rotate(360deg); } }
+
 .lat-summary-chips { margin-top: 10px; line-height: 2; }
 .lat-session-head {
   display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: baseline;
