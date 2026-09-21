@@ -379,6 +379,53 @@ const CueLatency = (() => {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // 单场详情加载仲裁（「最后一次选择生效」）
+  //
+  // 页面快速切换场次时，旧场次的慢响应可能晚于新场次响应返回；若无条件落地，
+  // 就会覆盖新选择，导致场次下拉、URL 深链、岗位 / 结果筛选与瀑布内容错配。
+  // createDetailLoader 为每次 select(ref) 分配一个单调递增序号：
+  //   - select 同步触发 onLoading(ref)（页面据此立即展示加载态、清空旧内容）；
+  //   - fetcher(ref) 负责发起既有只读 GET 请求并返回 Promise；
+  //   - 响应 settle（成功或失败）时，仅当序号仍是最新（期间未再 select）才回调
+  //     onSuccess / onError；过期响应一律静默丢弃，对应 Promise 兑现为
+  //     { stale: true }，绝不更新分析结果、提示、筛选或地址栏。
+  // 纯编排函数：DOM 与 fetch 全部由页面注入，浏览器与 Node（测试）共用同一份。
+  // -------------------------------------------------------------------------
+  function createDetailLoader(hooks) {
+    const fetcher = hooks && hooks.fetcher;
+    const onLoading = hooks && hooks.onLoading;
+    const onSuccess = hooks && hooks.onSuccess;
+    const onError = hooks && hooks.onError;
+    let seq = 0;
+
+    function select(ref) {
+      const token = ++seq;
+      if (typeof onLoading === 'function') onLoading(ref);
+      return new Promise((resolve) => {
+        // fetcher 同步开始（真实 fetch 立即发出请求），同步抛出与 reject 等价
+        Promise.resolve().then(() => fetcher(ref)).then(
+          (payload) => {
+            if (token !== seq) { resolve({ stale: true, token }); return; }
+            if (typeof onSuccess === 'function') onSuccess(payload, ref);
+            resolve({ stale: false, token, payload });
+          },
+          (error) => {
+            // 旧选择的失败响应同样静默：错误提示只属于当前选择
+            if (token !== seq) { resolve({ stale: true, token, error }); return; }
+            if (typeof onError === 'function') onError(error, ref);
+            resolve({ stale: false, token, error });
+          }
+        );
+      });
+    }
+
+    return {
+      select,
+      isCurrent(token) { return token === seq; },
+    };
+  }
+
   return {
     STATUS_CONFIRMED,
     STATUS_LATE,
@@ -390,6 +437,7 @@ const CueLatency = (() => {
     analyzeSession,
     rowMatchesPosition,
     cueMatchesResult,
+    createDetailLoader,
   };
 })();
 

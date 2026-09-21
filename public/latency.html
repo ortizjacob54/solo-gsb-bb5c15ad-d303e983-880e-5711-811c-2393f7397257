@@ -85,6 +85,53 @@
     let fileId = null;
     let runId = null;
 
+    // 单场详情加载态：切换期间给用户明确反馈。sessLoading 在首屏场次列表
+    // 加载完成后被隐藏，此处切换场次时复用它显示「正在读取场次详情」；
+    // 同时禁用岗位 / 结果筛选（内容尚未就绪，避免操作上一场的残留选项），
+    // 但场次下拉始终保持可用，允许不等待慢请求直接改选另一场。
+    function setDetailLoading(on) {
+      if (on) {
+        sessLoading.style.display = '';
+        sessLoading.innerHTML = '<span class="lat-spinner" aria-hidden="true"></span>正在读取场次详情…';
+        positionFilter.disabled = true;
+        resultFilter.disabled = true;
+        filterBar.style.display = 'none';
+        openReplay.style.display = 'none';
+      } else {
+        sessLoading.style.display = 'none';
+      }
+    }
+
+    // 当前选择对应的请求失败时：筛选条不展示，地址栏只保留 file/run
+    // （下拉已指向新场次；不能把上一场残留的岗位 / 结果筛选写进新场次深链）
+    function showDetailError(html) {
+      setDetailLoading(false);
+      positionFilter.value = 'all';
+      resultFilter.value = 'all';
+      emptyHint.style.display = '';
+      emptyHint.innerHTML = html;
+      syncUrl();
+    }
+
+    // 详情请求仲裁器（实现见 latency.js createDetailLoader）：
+    // 每次 loadSession 都经 loader.select 领取单调递增序号，只有当前选择
+    // 对应的成功 / 失败响应会进入 onSuccess / onError；旧选择的慢响应
+    // （成功或失败）在仲裁器内即被静默丢弃，绝不触碰分析结果、提示、
+    // 岗位 / 结果筛选与地址栏，避免下拉、URL 深链与瀑布内容错配。
+    // 仅复用既有只读 GET 接口 /api/replay/sessions/:fileId/:runId，不新增接口。
+    const detailLoader = CueLatency.createDetailLoader({
+      fetcher: (ref) => {
+        const [f, ...rParts] = String(ref).split('/');
+        return fetch(`/api/replay/sessions/${encodeURIComponent(f)}/${encodeURIComponent(rParts.join('/'))}`)
+          .then((res) => res.json());
+      },
+      onLoading: enterLoading,
+      onSuccess: applyPayload,
+      onError: () => {
+        showDetailError('<span style="color:#ff9c9c">场次数据加载失败，请确认服务已启动</span>');
+      },
+    });
+
     // 结果下拉的合法取值（与 <select> 选项保持一致；'all' 即「全部结果」）
     const RESULT_VALUES = new Set(['all', 'ok', 'late', 'timeout', 'revised', 'paused', 'substituted']);
 
@@ -379,27 +426,32 @@
 
     let rawPayload = null;
 
-    async function loadSession(ref) {
+    // 选择新场次（仲裁序号在 loader 内递增）：先记录目标引用、进入加载态；
+    // 请求发出后若再改选其他场次，本请求即刻过期，回调不会执行。
+    function loadSession(ref) {
       const [f, ...rParts] = String(ref).split('/');
-      const r = rParts.join('/');
       fileId = f;
-      runId = Number(r);
-      filterBar.style.display = 'none';
+      runId = Number(rParts.join('/'));
+      detailLoader.select(ref);
+    }
+
+    // 新请求开始（同步）：清空上一场内容并展示加载态
+    function enterLoading() {
+      rawPayload = null;
+      analysis = null;
       cueList.innerHTML = '';
       summaryBox.innerHTML = '';
       warnBox.classList.remove('show');
+      warnBox.innerHTML = '';
       emptyHint.style.display = 'none';
-      let payload;
-      try {
-        payload = await (await fetch(`/api/replay/sessions/${encodeURIComponent(f)}/${encodeURIComponent(r)}`)).json();
-      } catch {
-        emptyHint.style.display = '';
-        emptyHint.innerHTML = '<span style="color:#ff9c9c">场次数据加载失败，请确认服务已启动</span>';
-        return;
-      }
+      setDetailLoading(true);
+    }
+
+    // 仅当响应仍属于最后一次选择时才会走到这里（过期响应已在 loader 内丢弃）
+    function applyPayload(payload) {
+      setDetailLoading(false);
       if (payload.error) {
-        emptyHint.style.display = '';
-        emptyHint.innerHTML = `<span style="color:#ff9c9c">${E(payload.error)}</span>`;
+        showDetailError(`<span style="color:#ff9c9c">${E(payload.error)}</span>`);
         return;
       }
       rawPayload = payload;

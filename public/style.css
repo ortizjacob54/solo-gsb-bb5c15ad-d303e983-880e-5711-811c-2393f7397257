@@ -749,6 +749,20 @@ tr.current-row td { background: #24304a; }
 .lat-picker-row { display: flex; align-items: center; gap: 12px; }
 .lat-picker-row select { flex: 1 1 auto; }
 
+/* 切换场次期间的加载指示（详情请求未决，提示当前展示内容尚不可用） */
+.lat-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 8px;
+  vertical-align: -2px;
+  border: 2px solid #5a6379;
+  border-top-color: #9cc2ff;
+  border-radius: 50%;
+  animation: lat-spin 0.7s linear infinite;
+}
+@keyframes lat-spin { to { transform: rotate(360deg); } }
+
 .lat-summary-chips { margin-top: 10px; line-height: 2; }
 .lat-session-head {
   display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: baseline;

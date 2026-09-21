@@ -5,7 +5,9 @@
  *   四、替岗：确认计入接管岗位、超时标记随确认权移交
  *   五、暂停：deadline 顺延、有效等待扣除暂停、重复暂停 / 恢复
  *   六、汇总与筛选（按岗位、按结果）
- *   七、只读页面：HTTP GET 静态页、不创建 WebSocket、无新增服务端接口
+ *   七、暂停归一：嵌套重复 / 连续恢复 / 相切重叠 / 跨轮次 / 未闭合
+ *   八、只读页面：HTTP GET 静态页、不创建 WebSocket、无新增服务端接口
+ *   九、快速切换场次的请求仲裁：乱序成功 / 过期失败静默丢弃 / 加载态
  *
  * 运行前提：服务已在 localhost:3000 启动（npm start）。
  */
@@ -392,6 +394,102 @@ async function main() {
     replayApi.status === 200 && Array.isArray(replayApi.json.sessions));
   const noLatencyApi = await httpGet('/api/latency/sessions');
   check('不存在 /api/latency 写接口（模块完全复用复盘 GET）', noLatencyApi.status === 404);
+
+  console.log('九、快速切换场次的请求仲裁（最后一次选择生效，过期响应静默丢弃）');
+  // 竞态修复：旧场次的慢请求（成功或失败）晚返回时不得覆盖当前选择。
+  // 仲裁逻辑为 latency.js 中的可注入纯编排函数 createDetailLoader（页面只做
+  // DOM/fetch 接线），此处用可控的假 fetcher 直接构造乱序时序验证行为。
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  check('模块导出 createDetailLoader 仲裁器', typeof L.createDetailLoader === 'function');
+
+  // 1) 乱序成功：先选 A（慢），立即改选 B（快）——A 的慢响应必须静默丢弃
+  {
+    const events = [];
+    const loader = L.createDetailLoader({
+      fetcher: (ref) => ref === 'A'
+        ? sleep(30).then(() => ({ who: 'A' }))
+        : sleep(5).then(() => ({ who: 'B' })),
+      onLoading: (ref) => events.push(`loading:${ref}`),
+      onSuccess: (p, ref) => events.push(`success:${ref}:${p.who}`),
+      onError: (e, ref) => events.push(`error:${ref}`),
+    });
+    const pA = loader.select('A');
+    const pB = loader.select('B');
+    const [rA, rB] = await Promise.all([pA, pB]);
+    check('旧选择 A 的慢响应标记 stale 且不触发 onSuccess',
+      rA.stale === true && !events.includes('success:A:A'));
+    check('当前选择 B 的响应落地（onSuccess 一次）',
+      rB.stale === false && rB.payload.who === 'B' &&
+      events.filter((e) => e === 'success:B:B').length === 1);
+    check('每次选择同步进入加载态（A、B 各一次，顺序与选择一致）',
+      events[0] === 'loading:A' && events[1] === 'loading:B');
+    check('A 落地后再无任何回调：最终落地的只有 B（无错误回调）',
+      events.length === 3 && !events.some((e) => e.startsWith('error')));
+  }
+
+  // 2) 旧选择失败同样静默：A 慢且 reject，B 快且成功——不得弹出 A 的错误
+  {
+    const events = [];
+    const loader = L.createDetailLoader({
+      fetcher: (ref) => ref === 'A'
+        ? sleep(30).then(() => { throw new Error('boom-A'); })
+        : sleep(5).then(() => ({ who: 'B' })),
+      onLoading: (ref) => events.push(`loading:${ref}`),
+      onSuccess: (p, ref) => events.push(`success:${ref}`),
+      onError: (e, ref) => events.push(`error:${ref}:${e.message}`),
+    });
+    const pA = loader.select('A');
+    const pB = loader.select('B');
+    const [rA, rB] = await Promise.all([pA, pB]);
+    check('过期的失败响应不触发 onError（错误提示只属于当前选择）',
+      rA.stale === true && rA.error.message === 'boom-A' &&
+      !events.some((e) => e.startsWith('error:A')));
+    check('当前选择 B 仍正常成功', rB.stale === false && events.includes('success:B'));
+  }
+
+  // 3) 当前选择失败要如实报错（不被误判为过期）
+  {
+    const events = [];
+    const loader = L.createDetailLoader({
+      fetcher: () => sleep(5).then(() => { throw new Error('net'); }),
+      onLoading: () => events.push('loading'),
+      onSuccess: () => events.push('success'),
+      onError: (e) => events.push(`error:${e.message}`),
+    });
+    const r = await loader.select('X');
+    check('当前选择的失败响应触发一次 onError 且非 stale',
+      r.stale === false && r.error.message === 'net' &&
+      events.length === 2 && events[1] === 'error:net');
+  }
+
+  // 4) 连续三次切换：只有最后一次的响应落地
+  {
+    const landed = [];
+    const loader = L.createDetailLoader({
+      fetcher: (ref) => sleep(ref === 'C' ? 5 : 40).then(() => ({ who: ref })),
+      onLoading: () => {},
+      onSuccess: (p) => landed.push(p.who),
+      onError: () => landed.push('ERR'),
+    });
+    await Promise.all([loader.select('A'), loader.select('B'), loader.select('C')]);
+    check('A→B→C 连续切换后仅 C 落地一次',
+      landed.length === 1 && landed[0] === 'C');
+  }
+
+  // 页面接线：复用仲裁器与既有只读 GET；切换期间有明确加载态；不新增接口
+  check('页面通过 CueLatency.createDetailLoader 发起单场详情加载',
+    /CueLatency\.createDetailLoader/.test(page.body));
+  check('fetcher 仍只请求既有只读 GET /api/replay/sessions/:fileId/:runId',
+    /\/api\/replay\/sessions\/\$\{encodeURIComponent\(f\)\}\/\$\{encodeURIComponent\(rParts\.join\('\/'\)\)\}/.test(page.body) &&
+    !/\/api\/latency/.test(page.body));
+  check('切换期间显示「正在读取场次详情」并禁用岗位 / 结果筛选，场次下拉保持可改选',
+    /正在读取场次详情/.test(page.body) &&
+    /positionFilter\.disabled\s*=\s*true/.test(page.body) &&
+    /resultFilter\.disabled\s*=\s*true/.test(page.body) &&
+    !/sessionSelect\.disabled\s*=\s*true/.test(page.body));
+  check('页面不创建 WebSocket、无写请求',
+    !/new\s+WebSocket\s*\(/.test(page.body) &&
+    !/method\s*:\s*['"](POST|PUT|DELETE|PATCH)/i.test(page.body));
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   process.exit(failed ? 1 : 0);
